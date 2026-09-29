@@ -1,0 +1,350 @@
+"""Model inference layer (no Streamlit). Copied from the original app so the
+original project stays untouched. All functions accept file paths."""
+import os, json
+from datetime import timedelta
+from functools import lru_cache
+import numpy as np, pandas as pd, joblib
+from PIL import Image
+from keras.models import load_model
+
+def resolve_string_config(parallel_strings: int) -> str:
+    return "1-string" if parallel_strings <= 1 else "3-string"
+
+MODELS_DIR = os.environ.get("MODELS_DIR", "models")
+
+CNN_MODEL_PATH = os.path.join(MODELS_DIR, "CNN_PV_Fault_Model.keras")
+CLASS_MAPPING_PATH = os.path.join(MODELS_DIR, "class_mapping.json")
+
+THERMAL_MODEL_PATH = os.path.join(MODELS_DIR, "best_thermal_shadowing_model.keras")
+THERMAL_CLASS_NAMES_PATH = os.path.join(MODELS_DIR, "thermal_class_names.json")
+
+RF_MODEL_1_PATH = os.path.join(MODELS_DIR, "rf_model_1_string.pkl")
+RF_SCALER_1_PATH = os.path.join(MODELS_DIR, "rf_scaler_1_string.pkl")
+RF_MODEL_3_PATH = os.path.join(MODELS_DIR, "rf_model_3_string.pkl")
+RF_SCALER_3_PATH = os.path.join(MODELS_DIR, "rf_scaler_3_string.pkl")
+
+LSTM_MODEL_PATH = os.path.join(MODELS_DIR, "LSTM_RUL_Model.keras")
+LSTM_SCALER_PATH = os.path.join(MODELS_DIR, "lstm_scaler.pkl")
+LSTM_WINDOW = 12  # must match training script
+
+# RF models predict an integer-coded label (0-4); order matches training.
+RF_CLASS_NAMES = ['Normal', 'Shading', 'Short', 'Connector', 'OC']
+
+# --------------------------------------------------------------------------
+# ARRAY-CONFIG + PANEL-TYPE SCALING
+# --------------------------------------------------------------------------
+# The RF models were trained on one specific simulated panel (66 cells,
+# Voc 47.42V, Isc 15A, Vmp 39.51V, Imp 14.17A), wired 7 in series and either
+# 1 or 3 strings in parallel. Two independent things can mismatch a real
+# reading, and both get corrected before scoring:
+#   1. ARRAY WIRING -- voltage scales with series count, current scales with
+#      parallel count, power scales with both.
+#   2. PANEL TYPE -- a different physical panel. We normalize the reading to
+#      a fraction of the user's own panel ratings, then re-scale that
+#      fraction onto the reference panel's ratings (assumes similar IV-curve
+#      shape; doesn't correct for differing temperature coefficients).
+# Temperature/irradiance readings are left unchanged by either correction.
+
+REFERENCE_PANELS_IN_SERIES = 7  # panels per string the models were trained on
+
+REFERENCE_PARALLEL_STRINGS = {
+    "1-string": 1,
+    "3-string": 3,
+}
+
+REFERENCE_PANEL_SPECS = {
+    "Voc": 47.42,   # open-circuit voltage (V)
+    "Isc": 15.0,    # short-circuit current (A)
+    "Vmp": 39.51,   # voltage at max power point (V)
+    "Imp": 14.17,   # current at max power point (A)
+}
+REFERENCE_PANEL_SPECS["Pmax"] = REFERENCE_PANEL_SPECS["Vmp"] * REFERENCE_PANEL_SPECS["Imp"]
+
+# Maps each data column to which array dimension it scales with, and which
+# nameplate spec it should be normalized against. Temp_C / Irr_Wm2 are
+# intentionally absent -- they don't scale with wiring or panel type.
+COLUMN_SCALE_CONFIG = {
+    "Voc_V":  {"array_dim": "series",   "spec_key": "Voc"},
+    "Vmp_V":  {"array_dim": "series",   "spec_key": "Vmp"},
+    "Isc_A":  {"array_dim": "parallel", "spec_key": "Isc"},
+    "Imp_A":  {"array_dim": "parallel", "spec_key": "Imp"},
+    "Pmax_W": {"array_dim": "both",     "spec_key": "Pmax"},
+}
+
+
+def scale_reading(df: pd.DataFrame, panels_in_series: int, parallel_strings: int,
+                   reference_parallel_strings: int, user_panel_specs: dict) -> pd.DataFrame:
+    """Project a reading from a real array (possibly a different panel model,
+    wired differently) onto the reference array/panel the model was trained on."""
+    if panels_in_series is None or panels_in_series <= 0:
+        raise ValueError("Panels in series must be a positive number.")
+    if parallel_strings is None or parallel_strings <= 0:
+        raise ValueError("Parallel strings must be a positive number.")
+
+    series_ratio = REFERENCE_PANELS_IN_SERIES / panels_in_series
+    parallel_ratio = reference_parallel_strings / parallel_strings
+    dim_ratio = {"series": series_ratio, "parallel": parallel_ratio,
+                 "both": series_ratio * parallel_ratio}
+
+    user_panel_specs = dict(user_panel_specs or {})
+    if "Pmax" not in user_panel_specs and "Vmp" in user_panel_specs and "Imp" in user_panel_specs:
+        user_panel_specs["Pmax"] = user_panel_specs["Vmp"] * user_panel_specs["Imp"]
+
+    df = df.copy()
+    for col, cfg in COLUMN_SCALE_CONFIG.items():
+        if col not in df.columns:
+            continue
+        array_ratio = dim_ratio[cfg["array_dim"]]
+
+        spec_key = cfg["spec_key"]
+        actual_val = user_panel_specs.get(spec_key)
+        ref_val = REFERENCE_PANEL_SPECS[spec_key]
+        panel_ratio = (ref_val / actual_val) if actual_val else 1.0  # no user spec -> same panel
+
+        df[col] = df[col] * array_ratio * panel_ratio
+    return df
+
+
+# --------------------------------------------------------------------------
+# CACHED MODEL LOADERS
+# --------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def load_cnn():
+    model = load_model(CNN_MODEL_PATH)
+    with open(CLASS_MAPPING_PATH) as f:
+        class_mapping = json.load(f)
+    return model, class_mapping
+
+
+@lru_cache(maxsize=None)
+def load_thermal_cnn():
+    model = load_model(THERMAL_MODEL_PATH)
+    with open(THERMAL_CLASS_NAMES_PATH) as f:
+        thermal_meta = json.load(f)
+    # thermal_class_names.json stores {"classes": {"0": "Cracking", ...}} --
+    # index -> label directly, unlike class_mapping.json (Keras class_indices,
+    # label -> index) used by the RGB CNN. Different source format, so no
+    # inversion needed here.
+    index_to_label = {int(k): v for k, v in thermal_meta["classes"].items()}
+    return model, index_to_label
+
+
+@lru_cache(maxsize=None)
+def load_rf():
+    model_1 = joblib.load(RF_MODEL_1_PATH)
+    scaler_1 = joblib.load(RF_SCALER_1_PATH)
+    model_3 = joblib.load(RF_MODEL_3_PATH)
+    scaler_3 = joblib.load(RF_SCALER_3_PATH)
+    return (model_1, scaler_1), (model_3, scaler_3)
+
+
+@lru_cache(maxsize=None)
+def load_lstm():
+    model = load_model(LSTM_MODEL_PATH)
+    scaler = joblib.load(LSTM_SCALER_PATH)
+    return model, scaler
+
+
+# INFERENCE: CNN (image fault detection)
+# --------------------------------------------------------------------------
+
+def run_cnn_inference(uploaded_file):
+    model, class_mapping = load_cnn()
+
+    _, target_h, target_w, channels = model.input_shape
+    img = Image.open(uploaded_file).convert("RGB" if channels == 3 else "L")
+    img = img.resize((target_w, target_h))
+    arr = np.array(img) / 255.0
+    arr = np.expand_dims(arr, axis=0)
+
+    preds = model.predict(arr, verbose=0)[0]
+    class_idx = int(np.argmax(preds))
+    confidence = float(preds[class_idx]) * 100
+
+    # class_mapping.json was saved from Keras's class_indices ({label: index}).
+    index_to_label = {v: k for k, v in class_mapping.items()}
+    label = index_to_label.get(class_idx, f"Class_{class_idx}")
+
+    return {
+        "data_type": "RGB Image",
+        "detection": label,
+        "confidence": round(confidence, 2),
+    }
+
+
+def run_thermal_cnn_inference(uploaded_file):
+    model, index_to_label = load_thermal_cnn()
+
+    _, target_h, target_w, channels = model.input_shape
+    img = Image.open(uploaded_file).convert("RGB" if channels == 3 else "L")
+    img = img.resize((target_w, target_h))
+    # NOTE: no /255 here. This model has mobilenet_v2.preprocess_input() baked
+    # in as a layer (see train_thermal.py) -- dividing by 255 first would
+    # double-preprocess the image and feed the model garbage, same as the
+    # explicit warnings in test_thermal.py / check_validation.py.
+    arr = np.array(img).astype("float32")
+    arr = np.expand_dims(arr, axis=0)
+
+    preds = model.predict(arr, verbose=0)[0]
+    class_idx = int(np.argmax(preds))
+    confidence = float(preds[class_idx]) * 100
+
+    label = index_to_label.get(class_idx, f"Class_{class_idx}")
+
+    return {
+        "data_type": "Thermal Image",
+        "detection": label,
+        "confidence": round(confidence, 2),
+        # fusion.py needs the full distribution -- e.g. it may need to read
+        # the Shadowing probability even when Diode was the top-1 pick.
+        "_debug_class_probabilities": {
+            index_to_label.get(i, f"Class_{i}"): round(float(p), 4)
+            for i, p in enumerate(preds)
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# INFERENCE: Random Forest (single-row sensor snapshot)
+# --------------------------------------------------------------------------
+
+def run_rf_inference_from_df(df: pd.DataFrame, string_config: str,
+                              panels_in_series: int = REFERENCE_PANELS_IN_SERIES,
+                              parallel_strings: int = None,
+                              user_panel_specs: dict = None):
+    """string_config: '1-string' or '3-string', picks which trained model to
+    use. panels_in_series / parallel_strings describe the actual array wiring
+    the reading came from. user_panel_specs (Voc/Isc/Vmp/Imp) describes the
+    actual panel model in use; leave None to assume the reference panel."""
+    (model_1, scaler_1), (model_3, scaler_3) = load_rf()
+
+    if string_config == "1-string":
+        model, scaler = model_1, scaler_1
+    elif string_config == "3-string":
+        model, scaler = model_3, scaler_3
+    else:
+        raise ValueError(f"Unknown string_config: {string_config}")
+
+    reference_parallel = REFERENCE_PARALLEL_STRINGS[string_config]
+    if parallel_strings is None:
+        parallel_strings = reference_parallel
+
+    missing = set(scaler.feature_names_in_) - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Data is missing columns required by the {string_config} model: {sorted(missing)}\n"
+            f"Expected columns: {list(scaler.feature_names_in_)}"
+        )
+
+    df = scale_reading(df, panels_in_series, parallel_strings, reference_parallel, user_panel_specs)
+
+    X = df[scaler.feature_names_in_].values
+    X_scaled = scaler.transform(X)
+
+    pred = model.predict(X_scaled)[0]
+    proba_vec = None
+    if hasattr(model, "predict_proba"):
+        proba_vec = model.predict_proba(X_scaled)[0]
+
+    try:
+        label = RF_CLASS_NAMES[int(pred)]
+    except (ValueError, IndexError, TypeError):
+        label = str(pred)
+
+    confidence = round(float(np.max(proba_vec)) * 100, 2) if proba_vec is not None else "N/A"
+
+    panel_note = "reference panel" if not user_panel_specs else "custom panel, normalized"
+    result = {
+        "data_type": (
+            f"Sensor Snapshot ({string_config} model, "
+            f"{panels_in_series} panels/string, {parallel_strings} parallel, {panel_note})"
+        ),
+        "detection": label,
+        "confidence": confidence,
+    }
+
+    if proba_vec is not None:
+        result["_debug_class_probabilities"] = {
+            RF_CLASS_NAMES[i] if i < len(RF_CLASS_NAMES) else str(i): round(float(p), 4)
+            for i, p in enumerate(proba_vec)
+        }
+    result["_debug_features_used"] = {
+        col: float(val) for col, val in zip(scaler.feature_names_in_, X[0])
+    }
+
+    return result
+
+
+def run_rf_inference(uploaded_file, string_config: str,
+                      panels_in_series: int = REFERENCE_PANELS_IN_SERIES,
+                      parallel_strings: int = None,
+                      user_panel_specs: dict = None):
+    df = pd.read_csv(uploaded_file)
+    return run_rf_inference_from_df(df, string_config, panels_in_series, parallel_strings, user_panel_specs)
+
+
+# --------------------------------------------------------------------------
+# INFERENCE: LSTM (time-series RUL projection)
+# --------------------------------------------------------------------------
+
+def run_lstm_inference(uploaded_file):
+    model, scaler = load_lstm()
+    df = pd.read_csv(uploaded_file)
+
+    if "Health_Indicator" not in df.columns:
+        raise ValueError("Expected a 'Health_Indicator' column in the time-series CSV.")
+
+    values = df["Health_Indicator"].values.reshape(-1, 1)
+    if len(values) < LSTM_WINDOW:
+        raise ValueError(f"Need at least {LSTM_WINDOW} rows of history for a projection.")
+
+    scaled = scaler.transform(values)
+    threshold = df["Health_Indicator"].iloc[0] * 0.8
+
+    current_batch = scaled[-LSTM_WINDOW:].reshape(1, LSTM_WINDOW, 1)
+    future_projections = []
+    for _ in range(24):
+        current_pred = model.predict(current_batch, verbose=0)
+        future_projections.append(current_pred[0, 0])
+        current_batch = np.append(current_batch[:, 1:, :], [current_pred], axis=1)
+
+    projected_vals = scaler.inverse_transform(np.array(future_projections).reshape(-1, 1))
+    failure_indices = np.where(projected_vals < threshold)[0]
+
+    # The 24-month projection window is anchored to the LOG's own last
+    # timestamp, not to today -- correct for the model (it only knows what's
+    # in the log), but if the uploaded log is itself historical/stale, the
+    # "projected failure date" can land in the past relative to right now.
+    # We surface that distinction explicitly rather than silently handing the
+    # agent a past-dated failure and letting it write "schedule before X".
+    today = pd.Timestamp.today().normalize()
+    if "timestamp" in df.columns:
+        last_date = pd.to_datetime(df["timestamp"]).iloc[-1]
+    else:
+        last_date = today
+    log_is_stale = last_date < today - timedelta(days=30)
+
+    projection_dates = pd.date_range(start=last_date + timedelta(days=30), periods=24, freq="ME")
+
+    failure_date = None
+    failure_already_elapsed = False
+    if len(failure_indices) > 0:
+        failure_date = projection_dates[failure_indices[0]].strftime("%Y-%m-%d")
+        failure_already_elapsed = pd.Timestamp(failure_date) < today
+        detection = f"Projected failure around {failure_date}"
+    else:
+        detection = "No failure projected within the next 2 years"
+
+    return {
+        "data_type": "Time-Series Sensor Log",
+        "detection": detection,
+        "confidence": "N/A",
+        "current_health": round(float(df["Health_Indicator"].iloc[-1]), 2),
+        "threshold": round(float(threshold), 2),
+        "failure_date": failure_date,
+        "last_reading_date": last_date.strftime("%Y-%m-%d"),
+        "log_is_stale": bool(log_is_stale),
+        "failure_already_elapsed": failure_already_elapsed,
+    }
+

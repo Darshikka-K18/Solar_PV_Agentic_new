@@ -1,0 +1,3 @@
+.streamlit/
+evaluation_log.csv
+__pycache__/

@@ -1,0 +1,10 @@
+tensorflow
+scikit-learn
+joblib
+pandas
+numpy
+pillow
+crewai
+litellm
+requests
+pydantic
