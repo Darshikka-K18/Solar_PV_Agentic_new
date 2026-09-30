@@ -1,6 +1,6 @@
 """Agentic layer: an LLM Router agent profiles the upload(s) and chooses the
 model tool itself (no if/else routing), then a Diagnostic agent writes the ticket."""
-import os, json, csv
+import os, json
 from datetime import datetime
 from pathlib import Path
 import numpy as np, pandas as pd
@@ -81,7 +81,7 @@ def run_rf_model(file_path: str) -> str:
     def go():
         c = CONFIG
         return inf.run_rf_inference(file_path, inf.resolve_string_config(c["parallel_strings"]),
-                                    c["panels_in_series"], c["parallel_strings"], c["panel_specs"])
+                                    c["panels_in_series"], c["parallel_strings"], c["panel_specs"] or None)
     return _traced("run_rf_model", {"file_path": file_path}, go)
 
 @tool("run_lstm_model")
@@ -96,7 +96,7 @@ def run_fusion(image_path: str, csv_path: str) -> str:
     are provided. Runs both models and fuses the result."""
     def go():
         c = CONFIG; sc = inf.resolve_string_config(c["parallel_strings"])
-        rf = inf.run_rf_inference(csv_path, sc, c["panels_in_series"], c["parallel_strings"], c["panel_specs"])
+        rf = inf.run_rf_inference(csv_path, sc, c["panels_in_series"], c["parallel_strings"], c["panel_specs"] or None)
         th = inf.run_thermal_cnn_inference(image_path)
         return fusion.fuse_predictions(rf, th, sc)
     return _traced("run_fusion", {"image_path": image_path, "csv_path": csv_path}, go)
@@ -108,15 +108,6 @@ def get_llm():
     _c.mark_cache_breakpoint = lambda msg: msg
     return LLM(model=os.environ.get("AGENT_MODEL", "groq/openai/gpt-oss-20b"),
                api_key=os.environ["GROQ_API_KEY"])
-
-def rule_route(paths):
-    """The OLD hard-coded logic, kept only as a baseline to measure the agent against."""
-    imgs = [p for p in paths if Path(p).suffix.lower() in (".jpg", ".jpeg", ".png")]
-    csvs = [p for p in paths if Path(p).suffix.lower() == ".csv"]
-    if imgs and csvs and len(pd.read_csv(csvs[0])) == 1: return "fusion"
-    if imgs: return "image"
-    if csvs: return "rf" if len(pd.read_csv(csvs[0])) == 1 else "lstm"
-    return "unknown"
 
 def run_agentic(paths, location="Kilinochchi", llm=None):
     TRACE.clear(); llm = llm or get_llm()
@@ -160,11 +151,16 @@ def run_agentic(paths, location="Kilinochchi", llm=None):
     result = Crew(agents=[router, expert], tasks=[route_task, ticket_task],
                   process=Process.sequential, verbose=True).kickoff()
 
-    used = [t["tool"] for t in TRACE if t["tool"] in MODEL_TOOLS]
-    agent_route = MODEL_TOOLS[used[-1]] if used else "none"
-    baseline = rule_route(paths)
-    with open("evaluation_log.csv", "a", newline="") as f:
-        csv.writer(f).writerow([datetime.now().isoformat(), used[-1] if used else "none",
-                                agent_route, baseline, agent_route == baseline])
-    return {"ticket": str(result), "trace": list(TRACE), "agent_route": agent_route,
-            "rule_route": baseline, "agree": agent_route == baseline}
+    return {"ticket": str(result), "summary": summarize(), "trace": list(TRACE)}
+
+
+MODEL_NAMES = {"run_rgb_model": "RGB image CNN", "run_thermal_model": "Thermal image CNN",
+               "run_rf_model": "Random Forest (sensor snapshot)", "run_lstm_model": "LSTM (time series)",
+               "run_fusion": "Sensor + thermal fusion"}
+
+def summarize():
+    """Key facts about the model the agent ended up running (for the UI)."""
+    for t in reversed(TRACE):
+        if t["tool"] in MODEL_NAMES:
+            return {"tool": t["tool"], "model": MODEL_NAMES[t["tool"]], "result": json.loads(t["result"])}
+    return None
