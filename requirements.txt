@@ -4,7 +4,8 @@ joblib
 pandas
 numpy
 pillow
-crewai
-litellm
+crewai==1.15.34
+litellm==1.101.0
+mcp>=1.30.0,<2
 requests
 pydantic
