@@ -43,11 +43,11 @@ def get_coordinates_for_location(location_name: str) -> str:
 
 @tool("Fetch Live Weather with Fallback")
 def fetch_weather_data(latitude: float, longitude: float) -> str:
-    """Fetches ambient temp (°C), cloud cover (%), and irradiance (W/m²) with retry & historical fallback."""
+    """Fetches ambient temp (°C), cloud cover (%), irradiance (W/m²), rain (mm) and wind (km/h) with retry & historical fallback."""
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={latitude}&longitude={longitude}&"
-        f"current=temperature_2m,cloud_cover,direct_normal_irradiance,diffuse_radiation"
+        f"current=temperature_2m,cloud_cover,direct_normal_irradiance,diffuse_radiation,precipitation,wind_speed_10m"
     )
     for attempt in range(3):
         try:
@@ -59,6 +59,8 @@ def fetch_weather_data(latitude: float, longitude: float) -> str:
                 "temperature_c": curr.get("temperature_2m", 25.0),
                 "cloud_cover_pct": curr.get("cloud_cover", 0),
                 "total_irradiance_wm2": round(direct + diffuse, 2),
+                "precipitation_mm": curr.get("precipitation", 0.0) or 0.0,
+                "wind_speed_kmh": curr.get("wind_speed_10m", 0.0) or 0.0,
                 "fallback_used": False
             })
         except Exception:
@@ -68,5 +70,7 @@ def fetch_weather_data(latitude: float, longitude: float) -> str:
         "temperature_c": 25.0,
         "cloud_cover_pct": 45.0,
         "total_irradiance_wm2": 600.0,
+        "precipitation_mm": 0.0,
+        "wind_speed_kmh": 8.0,
         "fallback_used": True
     })
